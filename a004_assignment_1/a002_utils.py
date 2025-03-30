@@ -1,4 +1,6 @@
+import copy
 import functools
+import heapq
 import json
 import pprint
 import traceback
@@ -9,8 +11,11 @@ from pathlib import Path
 from mpi4py import MPI
 from tqdm import tqdm
 
+from a004_assignment_1.a000_CFG import TEST_DATA_FOLDER
+from a004_assignment_1.a004_comparing_obj import ComparableObj
 
-def load_ndjson_file(
+
+def load_ndjson_file_multi_lines_to_list(
         ndjson_path_for_loading: str | Path,
         use_filter: bool = False,
 ) -> list:
@@ -31,9 +36,32 @@ def load_ndjson_file(
     return records
 
 
+def ndjson_oneline_to_multi_lines(
+        ndjson_path_for_loading: str | Path,
+        ndjson_path_for_output: str | Path,
+):
+    """
+    单行的多元素字典 -> 多行，每行一个字典元素
+    {k:v, k:v, ...} -> {k:v}\n {k:v}\n ...
+
+    Returns:
+
+    """
+    with open(ndjson_path_for_loading, "r", encoding="utf-8") as f1:
+        line = next(f1)
+        records = parse_one_line(line, use_filter=False)
+    with open(ndjson_path_for_output, "w", encoding="utf-8") as f2:
+        for k, v in records.items():
+            f2.write(
+                dict_to_a_line(
+                    {k: v}
+                )
+            )
+
+
 def parse_one_line(line, use_filter):
     if not line:
-        return
+        return None
     line = line.strip()
     record = json.loads(line)
     if use_filter:
@@ -76,22 +104,54 @@ def filter_a_record(record: dict):
     }
 
 
+def dict_of_items_to_list_of_dicts(dic):
+    """
+    change structure,
+    from {
+        'hour': score,
+        'hour': score,
+    }
+    to [
+        {'hour': score},
+        {'hour': score},
+    ]
+    """
+    return [{k: v} for k, v in dic.items()]
+
+
 def write_data_to_ndjson(
         records: list | dict,
         target_path: str | Path,
+        if_dict_is_single_dict,
 ):
     """将数据写入 NDJSON 文件。
 
     Args:
+        if_dict_is_single_dict:
         records (list | dict): 要写入的记录（单条或多条）。
         target_path (str | Path): 目标文件路径。
     """
-    if isinstance(records, dict):
-        records = [records]
     with open(target_path, "w", encoding="utf-8") as f:
-        for record in records:
-            f.write(
-                dict_to_a_line(record)
+        if isinstance(records, dict):
+            if if_dict_is_single_dict:
+                f.write(
+                    dict_to_a_line(records)
+                )
+            else:
+                for k, v in records.items():
+                    f.write(
+                        dict_to_a_line(
+                            {k: v}
+                        )
+                    )
+        elif isinstance(records, list):
+            for record in records:
+                f.write(
+                    dict_to_a_line(record)
+                )
+        else:
+            raise NotImplementedError(
+                f"records must be a list or dict, got {type(records)}"
             )
 
 
@@ -108,11 +168,15 @@ def high_level_api_to_filter_ndjson_and_save(
     Returns:
         list: 筛选后的记录列表。
     """
-    records = load_ndjson_file(
+    records = load_ndjson_file_multi_lines_to_list(
         ndjson_path_for_loading=ndjson_path_for_loading,
         use_filter=True,
     )
-    write_data_to_ndjson(records=records, target_path=ndjson_path_for_saving)
+    write_data_to_ndjson(
+        records=records,
+        target_path=ndjson_path_for_saving,
+        if_dict_is_single_dict=None,
+    )
     return records
 
 
@@ -186,18 +250,6 @@ def aggregate_score_by_hour(records: list) -> dict:
         if not time_s_score.get(created_hour):
             time_s_score[created_hour] = 0.0
         time_s_score[created_hour] += sentiment_score
-    # """
-    # change structure,
-    # from {
-    #     'hour': score,
-    #     'hour': score,
-    # }
-    # to [
-    #     {'hour': score},
-    #     {'hour': score},
-    # ]
-    # """
-    # return [{k: v} for k, v in time_s_score.items()]
     return time_s_score
 
 
@@ -254,24 +306,34 @@ def join_list_pieces(lst):
     return result
 
 
-def join_dict_pieces_hour_score(lst, mode="sum"):
+def join_dict_pieces_hour_score(lst, value_type, mode="sum"):
     """合并多个字典（按 key 聚合 value）。
 
     Args:
+        value_type: "scalar" or "list"
         lst (list): 字典组成的列表。
         mode (str, 可选): 聚合方式，目前支持 "sum"。默认为 "sum"。
 
     Returns:
         dict: 合并后的字典。
     """
+    if value_type not in ["scalar", "list"]:
+        raise NotImplementedError(
+            f"value_type must be scalar or list, but got {value_type}"
+        )
+
     result = {}
     for dic in lst:
         for k, v in dic.items():
-            if not result.get(k):
+            if k not in result:
+                v = copy.copy(v) if value_type == "list" else v
                 result[k] = v
             else:
                 if mode == "sum":
-                    result[k] += v
+                    if value_type == "scalar":
+                        result[k] += v
+                    else:
+                        result[k][0] += v[0]
     return result
 
 
@@ -313,7 +375,7 @@ def load_ndjson_file_by_process(
     return records
 
 
-def load_ndjson_file_by_process_and_calcu_score_at_the_same_time(
+def mpi_v3_subprocess(
         ndjson_path_for_loading,
         ndjson_line_num,
         process_num,
@@ -325,7 +387,7 @@ def load_ndjson_file_by_process_and_calcu_score_at_the_same_time(
     start_line = r * num_line_per_process + 1
     end_line = min(start_line + num_line_per_process, int(ndjson_line_num + 1))
 
-    time_s_score: dict = {}
+    hour_score: dict = {}
     failed_records = []
     with open(ndjson_path_for_loading, "r", encoding="utf-8") as f0:
         # 跳过前面的行
@@ -341,22 +403,161 @@ def load_ndjson_file_by_process_and_calcu_score_at_the_same_time(
             格式化时间，提取分数
             """
             try:
-                created_hour: str = high_level_api_to_convert_raw_time_to_preferred_str(
-                    record["doc"]["createdAt"]
+                created_hour, sentiment_score = retrieve_time_and_score_from_a_record(
+                    record=record,
                 )
-                sentiment_score = record["doc"]["sentiment"]
-
-                if not time_s_score.get(created_hour):
-                    time_s_score[created_hour] = 0.0
-                time_s_score[created_hour] += sentiment_score
             except Exception as e:
                 print(f"At line {i}, an exception occurred, {e}:")
                 traceback.print_exc()
                 pprint.pprint(record)
                 failed_records.append(record)
                 continue
+            else:
+                if created_hour not in hour_score:
+                    hour_score[created_hour] = 0.0
+                hour_score[created_hour] += sentiment_score
 
-    return time_s_score, failed_records
+    return hour_score, failed_records
+
+
+def mpi_v4_subprocess(file_path, use_filter=False):
+    """
+    Args:
+        file_path:
+        use_filter:
+
+    Returns:
+        Tuple[dict, dict, list]:
+            - hour_score: {
+                'str hour': float score,
+                ...
+              }
+            - id_score: {
+                'xx id': [float score, str username]
+              }
+            - failed_records: [record1, record2, ...]
+
+    """
+    hour_score = {}
+    id_score = {}
+    failed_records = []
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f, start=1):
+            # 解析单行
+            record = parse_one_line(line, use_filter=use_filter)
+            # 如果 parse_one_line() 返回 None，可能是空行或解析失败，直接跳过
+            if not record:
+                continue
+
+            # 尝试提取字段
+            try:
+                created_hour, sentiment_score = retrieve_time_and_score_from_a_record(
+                    record=record,
+                )
+                id_0, username_0, _ = retrieve_id_name_score_from_a_record(
+                    record=record,
+                )
+            except Exception as e:
+                # 如果该记录缺失关键字段或其他异常，把它加入失败列表
+                print(f"[{file_path}] 第 {idx} 行出现错误: {e}")
+                traceback.print_exc()
+                pprint.pprint(record)
+                failed_records.append(record)
+            else:
+                if created_hour not in hour_score:
+                    hour_score[created_hour] = sentiment_score
+                else:
+                    hour_score[created_hour] += sentiment_score
+
+                if id_0 not in id_score:
+                    id_score[id_0] = [sentiment_score, username_0]
+                else:
+                    id_score[id_0][0] += sentiment_score
+
+    return hour_score, id_score, failed_records
+
+
+def retrieve_time_and_score_from_a_record(record):
+    """
+    Args:
+        record:
+            {
+              "doc": {
+                "createdAt": "2025-02-10T03:06:02.000Z",
+                "sentiment": 0.021739130434782608,
+                "account": {
+                  "id": "109355759728457093",
+                  "username": "Lazarou"
+                }
+              }
+            }
+    Returns:
+
+    """
+    if "doc" not in record:
+        raise KeyError('missing key "doc" in record')
+    if not isinstance(record["doc"], dict):
+        raise KeyError('record["doc"] is not of dict type')
+    if "createdAt" not in record["doc"]:
+        raise KeyError('missing key "createdAt" in record["doc"]')
+    if "sentiment" not in record["doc"]:
+        raise KeyError('missing key "sentiment" in record["doc"]')
+
+    created_hour: str = high_level_api_to_convert_raw_time_to_preferred_str(
+        record["doc"]["createdAt"]
+    )
+    sentiment_score = record["doc"]["sentiment"]
+    return created_hour, sentiment_score
+
+
+def retrieve_id_name_score_from_a_record(record):
+    """
+    Args:
+        record:
+            {
+              "doc": {
+                "createdAt": "2025-02-10T03:06:02.000Z",
+                "sentiment": 0.021739130434782608,
+                "account": {
+                  "id": "109355759728457093",
+                  "username": "Lazarou"
+                }
+              }
+            }
+
+    Returns:
+        str: id_0
+        str: username_0
+        float: sentiment_0
+    """
+    # Ensure doc exists
+    if "doc" not in record:
+        raise KeyError('missing key "doc" in record')
+    if not isinstance(record["doc"], dict):
+        raise KeyError('record["doc"] is not of dict type')
+
+    doc = record["doc"]
+
+    # Ensure account exists
+    if "account" not in doc:
+        raise KeyError('missing key "account" in record["doc"]')
+    if not isinstance(doc["account"], dict):
+        raise KeyError('record["doc"]["account"] is not of dict type')
+
+    # Ensure fields exist
+    if "id" not in doc["account"]:
+        raise KeyError('missing key "id" in record["doc"]["account"]')
+    if "username" not in doc["account"]:
+        raise KeyError('missing key "username" in record["doc"]["account"]')
+    if "sentiment" not in doc:
+        raise KeyError('missing key "sentiment" in record["doc"]')
+
+    id_0 = doc["account"]["id"]
+    username_0 = doc["account"]["username"]
+    sentiment_0 = doc["sentiment"]
+
+    return id_0, username_0, sentiment_0
 
 
 def measure_time(func):
@@ -410,10 +611,10 @@ def split_file(
 
 
 def tst():
-    for _ in tqdm(range(int(1e8))):
-        pass
+    pass
 
 
 if __name__ == '__main__':
     # load_ndjson_file_by_process()
     tst()
+    # pass

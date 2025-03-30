@@ -36,3 +36,17 @@ def tst_load_ndjson_file_by_process():
         use_filter=True,
     )
     pass
+
+
+def tst():
+    dic = {
+        '1': 1,
+        '2': 2,
+    }
+    a = len(dic)
+    print(a)
+
+
+if __name__ == '__main__':
+    tst()
+    pass
